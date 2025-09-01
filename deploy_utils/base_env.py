@@ -1,6 +1,6 @@
 import torch
 import numpy as np
-from typing import Callable
+from typing import Callable, Any
 import threading
 import sys
 import select
@@ -20,6 +20,7 @@ class BaseEnv:
     def __init__(self, control_freq: int = 100, 
                  joint_order: list[str] | None = None,
                  action_joint_names: list[str] | None = None,
+                 joint_limits: list[tuple[float, float]] | np.ndarray | None = None,
                  release_time_delta: float = 0.0,
                  align_time: bool = True,
                  align_step_size: float = 0.00005,
@@ -27,6 +28,13 @@ class BaseEnv:
                  init_rclpy: bool = True,
                  spin_timeout: float = 0.001,
                  launch_input_thread: bool = True,
+                 simulated_state: bool = False,
+                 emergency_stop_condition: dict[str, Any] = {
+                    'joint_pos_limit': 0.98,
+                    'ignore_limit_joints': [],
+                    'roll_limit': 1.57,
+                 },
+                 emergency_stop_breakpoint: bool = True,
 
                  # Simulation only
                  model_path: str = '', 
@@ -51,6 +59,12 @@ class BaseEnv:
         self.input_callbacks: dict[str, Callable] = {}
         self.terminal_input_callbacks: list[Callable] = []
         self.launch_input_thread: bool = launch_input_thread
+        self.joint_limits: list[tuple[float, float]] | np.ndarray | None = joint_limits
+
+        # Emergency stop hooks
+        self.emergency_stop_hooks: list[Callable] = []
+        self.emergency_stop_condition: dict[str, Any] = emergency_stop_condition
+        self.emergency_stop_breakpoint: bool = emergency_stop_breakpoint
 
         # Launch input thread if enabled
         if self.launch_input_thread:
@@ -87,6 +101,15 @@ class BaseEnv:
     def register_terminal_input_callback(self, callback: Callable) -> None:
         """Register a callback for terminal input"""
         self.terminal_input_callbacks.append(callback)
+
+    def register_emergency_stop_hook(self, hook: Callable) -> None:
+        """Register an emergency stop hook"""
+        self.emergency_stop_hooks.append(hook)
+
+    def _call_emergency_stop_hooks(self) -> None:
+        """Call all emergency stop hooks"""
+        for hook in self.emergency_stop_hooks:
+            hook()
 
     def _input_thread(self):
         """Input thread"""

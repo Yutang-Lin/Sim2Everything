@@ -44,6 +44,8 @@ class MujocoEnv(BaseEnv):
                  joint_damping: float = 0.1, 
                  enable_viewer: bool = True,
                  enable_ros_control: bool = False,
+                 init_rclpy: bool = True,
+                 spin_timeout: float = 0.001,
                  release_time_delta: float = 0.0,
                  align_time: bool = True,
                  align_step_size: float = 0.00005,
@@ -77,6 +79,8 @@ class MujocoEnv(BaseEnv):
                          align_time=align_time,
                          align_step_size=align_step_size,
                          align_tolerance=align_tolerance,
+                         init_rclpy=init_rclpy,
+                         spin_timeout=spin_timeout,
                          **kwargs) # check kwargs
         self.model_path = model_path
         self.control_freq = control_freq
@@ -89,6 +93,8 @@ class MujocoEnv(BaseEnv):
         self.align_time = align_time
         self.align_step_size = align_step_size
         self.align_tolerance = align_tolerance
+        self.init_rclpy = init_rclpy
+        self.spin_timeout = spin_timeout
 
         # Validate control frequency
         if control_freq > simulation_freq:
@@ -167,6 +173,42 @@ class MujocoEnv(BaseEnv):
         self.register_input_callback('h', self.show_help)
         self.register_input_callback('p', self._set_random_targets)
         self.register_input_callback('z', self._set_zero_targets)
+
+        # ros control
+        if self.enable_ros_control:
+            import rclpy
+            from rclpy.node import Node
+            from unitree_hg.msg import (
+                LowState,
+                LowCmd,
+                MotorState,
+            )
+            from .gamepad import (
+                Gamepad,
+                parse_remote_data,
+            )
+            self.spin_once = rclpy.spin_once
+            self.parse_remote_data = parse_remote_data
+            if self.init_rclpy:
+                rclpy.init()
+            self._ros_node = Node('mujoco_env')
+            self.align_time = True
+            self._ros_lowstate_pub = self._ros_node.create_publisher(LowState, 'lowstate_buffer', 1)
+            self._ros_lowstate_sub = self._ros_node.create_subscription(LowState, 'lowstate', self._lowstate_callback, 1)
+            self._ros_lowcmd_sub = self._ros_node.create_subscription(LowCmd, 'lowcmd_buffer', self._lowcmd_callback, 1)
+            self._gamepad = Gamepad()
+            self._gamepad_lstick = [0.0, 0.0]
+            self._gamepad_rstick = [0.0, 0.0]
+            self._gamepad_actions = ['gamepad.L1.pressed', 'gamepad.L2.pressed', 
+                                    'gamepad.R1.pressed', 'gamepad.R2.pressed', 
+                                    'gamepad.A.pressed', 'gamepad.B.pressed', 
+                                    'gamepad.X.pressed', 'gamepad.Y.pressed',
+                                    'gamepad.start.pressed', 'gamepad.select.pressed']
+            motor_states = [MotorState() for _ in range(35)]
+            self._sim_lowstate = LowState(motor_state=motor_states)
+
+        # Reset flag
+        self.need_reset = False
         
         print(f"MuJoCo Environment initialized:")
         print(f"  Model: {model_path}")
@@ -177,6 +219,46 @@ class MujocoEnv(BaseEnv):
         print(f"  Decimation: {self.decimation} simulation steps per control step")
         print(f"  Armature: {joint_armature}")
         print(f"  Default PD gains: kp={self.kp[0]}, kd={self.kd[0]} (for all joints)")
+
+    def _lowstate_callback(self, msg):
+        """Callback for lowstate topic, just for receiving remote data"""
+        self._lowstate = msg
+        self._gamepad.update(self.parse_remote_data(msg.wireless_remote))
+        for action in self._gamepad_actions:
+            if eval('self.' + action):
+                for callback in self.input_callbacks[action]:
+                    callback()
+        self._gamepad_lstick = [self._gamepad.lx, self._gamepad.ly]
+        self._gamepad_rstick = [self._gamepad.rx, self._gamepad.ry]
+
+    def _lowcmd_callback(self, msg):
+        """Callback for lowcmd topic, just for sending remote data"""
+        self._lowcmd = msg
+        qs = np.array([x.q for x in self._lowcmd.motor_cmd]).astype(np.float32)[:len(self.joint_order_names)]
+        kps = np.array([x.kp for x in self._lowcmd.motor_cmd]).astype(np.float32)[:len(self.joint_order_names)]
+        kds = np.array([x.kd for x in self._lowcmd.motor_cmd]).astype(np.float32)[:len(self.joint_order_names)]
+        self.target_positions[self.action_joints] = qs
+        self.kp[self.action_joints] = kps
+        self.kd[self.action_joints] = kds
+
+    def _publish_lowstate(self):
+        """Publish lowstate data to lowstate_buffer topic"""
+        lowstate = deepcopy(self._sim_lowstate)
+        joint_state = self.get_joint_data()
+        root_state = self.get_root_data()
+        for k, v in root_state.items():
+            root_state[k] = v.numpy().astype(np.float32)
+        for k, v in joint_state.items():
+            joint_state[k] = v.numpy().astype(np.float32)
+        for i in range(len(self._joint_order)):
+            lowstate.motor_state[i].mode = 1
+            lowstate.motor_state[i].q = float(joint_state['joint_pos'][i])
+            lowstate.motor_state[i].dq = float(joint_state['joint_vel'][i])
+        lowstate.imu_state.rpy = root_state['root_rpy']
+        lowstate.imu_state.quaternion = root_state['root_quat']
+        lowstate.imu_state.gyroscope = root_state['root_ang_vel']
+        self._sim_lowstate = lowstate
+        self._ros_lowstate_pub.publish(self._sim_lowstate)
     
     def _setup_joint_armature(self):
         """Set joint armature (motor inertia) for all joints"""
@@ -202,6 +284,10 @@ class MujocoEnv(BaseEnv):
             self.model.actuator_gainprm[i] = self.kp[i]  # kp
             self.model.actuator_biasprm[i] = self.kd[i]  # kd
         print(f"Updated model actuator gains: kp={self.kp}, kd={self.kd}")
+
+    def _reset_callback(self):
+        """Reset callback"""
+        self.need_reset = True
 
     def reset(self, fix_root=False):
         """
@@ -232,8 +318,15 @@ class MujocoEnv(BaseEnv):
         # Update internal state
         self.root_fixed = fix_root
         self.step_count = 0
+
+        # Reset flag
+        self.need_reset = False
         
         print(f"Robot reset! Root {'fixed (floating)' if fix_root else 'free'}")
+
+    def set_root_fixed(self, fixed=False):
+        """Set root fixed"""
+        self.root_fixed = fixed
 
     def refresh_data(self):
         """Refresh data"""
@@ -424,6 +517,11 @@ class MujocoEnv(BaseEnv):
         Returns:
             bool: True if simulation is still running, False if it should stop
         """
+        if self.enable_ros_control and actions is not None:
+            raise ValueError("When enable_ros_control is true, actions should no be passed to step")
+        if self.enable_ros_control:
+            self.spin_once(self._ros_node, timeout_sec=self.spin_timeout)
+
         control_period = self.decimation / self.simulation_freq  # seconds per control step
         start_time = time.time()
         # Update target positions if provided
@@ -458,6 +556,10 @@ class MujocoEnv(BaseEnv):
             
             # Step simulation
             mujoco.mj_step(self.model, self.data) # type: ignore
+
+            # Publish lowstate
+            if self.enable_ros_control:
+                self._publish_lowstate()
             
             # self.viewer.sync()
             # Sync viewer if enabled (only on the last step to avoid excessive syncing)
@@ -466,6 +568,10 @@ class MujocoEnv(BaseEnv):
             
         # Update step count
         self.step_count += 1
+
+        # Reset if needed
+        if self.need_reset:
+            self.reset(fix_root=self.root_fixed)
 
         # Compute step frequency
         self.step_times.append(time.monotonic() - self.last_step_time)
@@ -555,6 +661,25 @@ class MujocoEnv(BaseEnv):
             self.viewer.close()
         print("Environment closed.")
 
+    def add_visual_sphere(self, pos, radius=0.01, rgba=(1, 0, 0, 1)):
+        """Add a visual sphere to the viewer"""
+        if self.viewer.user_scn.ngeom >= self.viewer.user_scn.maxgeom:
+            return
+        self.viewer.user_scn.ngeom += 1  # increment ngeom
+        if isinstance(rgba, torch.Tensor):
+            rgba = rgba.cpu().numpy()
+        elif isinstance(rgba, (list, tuple)):
+            rgba = np.array(rgba)
+        assert isinstance(rgba, np.ndarray)
+        assert rgba.shape == (4,)
+        # initialise a new capsule, add it to the scene using mjv_makeConnector
+        mujoco.mjv_initGeom(self.viewer.user_scn.geoms[self.viewer.user_scn.ngeom-1],
+                        mujoco.mjtGeom.mjGEOM_CAPSULE, np.zeros(3),
+                        np.zeros(3), np.zeros(9), rgba.astype(np.float32))
+        mujoco.mjv_connector(self.viewer.user_scn.geoms[self.viewer.user_scn.ngeom-1],
+                            mujoco.mjtGeom.mjGEOM_CAPSULE, radius,
+                            pos, pos + 1e-3)
+        return self.viewer.user_scn.geoms[self.viewer.user_scn.ngeom-1]
 
 def main():
     """Main function to run the simulation"""

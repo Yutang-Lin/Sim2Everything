@@ -53,6 +53,7 @@ class UnitreeEnv(BaseEnv, Node):
                  align_tolerance: float = 2.0,
                  init_rclpy: bool = True,
                  spin_timeout: float = 0.001,
+                 simulated_state: bool = False,
                  **kwargs):
         """
         Initialize MuJoCo environment
@@ -76,6 +77,7 @@ class UnitreeEnv(BaseEnv, Node):
                          align_tolerance=align_tolerance,
                          init_rclpy=init_rclpy,
                          spin_timeout=spin_timeout,
+                         simulated_state=simulated_state,
                          **kwargs) # check kwargs
         self.control_freq = control_freq
         self.control_dt = 1.0 / self.control_freq
@@ -84,7 +86,18 @@ class UnitreeEnv(BaseEnv, Node):
         self.align_step_size = align_step_size
         self.align_tolerance = align_tolerance
         self.spin_timeout = spin_timeout
-        
+        self.simulated_state = simulated_state
+        assert self.joint_limits is not None, "joint_limits must be provided when using sim2real"
+        if isinstance(self.joint_limits, (list, tuple)):
+            self.joint_limits = torch.tensor(self.joint_limits)
+        elif isinstance(self.joint_limits, np.ndarray):
+            self.joint_limits = torch.from_numpy(self.joint_limits)
+        assert isinstance(self.joint_limits, torch.Tensor)
+        assert self.joint_limits.ndim == 2
+        assert self.joint_limits.shape[1] == 2
+        assert self.joint_limits.shape[0] == len(joint_order)
+        self.ignore_limit_joints = self.emergency_stop_condition.get('ignore_limit_joints', [])
+
         # State variables
         self.step_count = 0
 
@@ -98,6 +111,10 @@ class UnitreeEnv(BaseEnv, Node):
         self.joint_names = joint_order
         # Get body names
         self.body_names = None
+        # Compute Ignore Joint Mask
+        self.joint_limit_mask = torch.tensor([not (name in self.ignore_limit_joints) for name in joint_order], dtype=torch.bool)
+        assert self.joint_limit_mask.ndim == 1
+        assert self.joint_limit_mask.shape[0] == len(joint_order)
 
         # Set num joints
         self.num_joints = len(joint_order)
@@ -107,10 +124,11 @@ class UnitreeEnv(BaseEnv, Node):
             rclpy.init()
         Node.__init__(self, 'unitree_env')
 
+        lowstate_topic = 'lowstate_buffer' if simulated_state else 'lowstate'
         # Create a subscriber to listen to an input topic (such as 'input_topic')
         self.lowstate_sub = self.create_subscription(
             LowState,  # Replace with your message type
-            'lowstate',  # Replace with your input topic name
+            lowstate_topic,  # Replace with your input topic name
             self._lowstate_callback,
             1
         )
@@ -187,8 +205,8 @@ class UnitreeEnv(BaseEnv, Node):
             self.lowcmd_initialized = True
             self.lowcmd.mode_pr = msg.mode_pr
             self.lowcmd.mode_machine = msg.mode_machine
-            motor_cmds = [x for x in msg.motor_state if x.mode == 1]
-            assert len(motor_cmds) == self.num_joints, f"Expected {self.num_joints} motor commands, got {len(motor_cmds)}"
+        motor_cmds = [x for x in msg.motor_state if x.mode == 1]
+        assert len(motor_cmds) == self.num_joints, f"Expected {self.num_joints} motor commands, got {len(motor_cmds)}"
 
         self.gamepad.update(parse_remote_data(msg.wireless_remote))
         for action in self.gamepad_actions:
@@ -201,8 +219,42 @@ class UnitreeEnv(BaseEnv, Node):
         self.joint_pos[:] = torch.tensor([x.q for x in motor_cmds]).float()
         self.joint_vel[:] = torch.tensor([x.dq for x in motor_cmds]).float()
         self.root_rpy[:] = torch.tensor([msg.imu_state.rpy[0], msg.imu_state.rpy[1], msg.imu_state.rpy[2]]).float()    
-        self.root_quat[:] = torch.tensor([msg.imu_state.quaternion[3], msg.imu_state.quaternion[0], msg.imu_state.quaternion[1], msg.imu_state.quaternion[2]]).float()
+        self.root_quat[:] = torch.tensor([msg.imu_state.quaternion[0], msg.imu_state.quaternion[1], msg.imu_state.quaternion[2], msg.imu_state.quaternion[3]]).float()
         self.root_ang_vel[:] = torch.tensor([msg.imu_state.gyroscope[0], msg.imu_state.gyroscope[1], msg.imu_state.gyroscope[2]]).float()
+        self._check_emergency_stop_condition()
+
+    def _check_emergency_stop_condition(self) -> bool:
+        """Check if the emergency stop condition is met"""
+        emergency_stop = False
+        if 'joint_pos_limit' in self.emergency_stop_condition:
+            limit_factor = self.emergency_stop_condition['joint_pos_limit']
+            exceed_high = (self.joint_pos >= self.joint_limits[:, 1] * limit_factor) & self.joint_limit_mask
+            exceed_low = (self.joint_pos <= self.joint_limits[:, 0] * limit_factor) & self.joint_limit_mask
+            any_exceed_high = torch.any(exceed_high).item()
+            any_exceed_low = torch.any(exceed_low).item()
+            if any_exceed_high or any_exceed_low:
+                if any_exceed_high:
+                    print(f"Joint position limit high exceeded: {exceed_high.nonzero().squeeze(-1)}")
+                if any_exceed_low:
+                    print(f"Joint position limit low exceeded: {exceed_low.nonzero().squeeze(-1)}")
+                emergency_stop = True
+
+        if 'roll_limit' in self.emergency_stop_condition:
+            limit_factor = self.emergency_stop_condition['roll_limit']
+            if self.root_rpy[0].abs().item() >= limit_factor:
+                print(f"Root roll limit exceeded: {self.root_rpy[0].item()}")
+                emergency_stop = True
+
+        if emergency_stop:
+            # emergency stop
+            print(f"Emergency stop triggered")
+            self._call_emergency_stop_hooks()
+            if self.emergency_stop_breakpoint:
+                self.target_positions[:] = self.joint_pos.clone()
+                self.apply_pd_control()
+                print(f"Emergency stop breakpoint triggered, exiting...")
+                sys.exit(0)
+        return emergency_stop
 
     def reset(self, fix_root=False):
         """
@@ -375,7 +427,7 @@ class UnitreeEnv(BaseEnv, Node):
             assert isinstance(actions, torch.Tensor)
             if len(actions) != len(self.action_joints):
                 raise ValueError(f"Expected actions array of length {len(self.action_joints)}, got {len(actions)}")
-            self.target_positions[self.action_joints] = actions.clone().float()
+            self.target_positions[self.action_joints] = actions.clone().float().cpu()
 
         # Update step count
         self.step_count += 1
