@@ -205,19 +205,20 @@ class UnitreeEnv(BaseEnv, Node):
             self.lowcmd_initialized = True
             self.lowcmd.mode_pr = msg.mode_pr
             self.lowcmd.mode_machine = msg.mode_machine
-        motor_cmds = [x for x in msg.motor_state if x.mode == 1]
-        assert len(motor_cmds) == self.num_joints, f"Expected {self.num_joints} motor commands, got {len(motor_cmds)}"
+        motor_cmds = [x for x in msg.motor_state]
+        # assert len(motor_cmds) == self.num_joints, f"Expected {self.num_joints} motor commands, got {len(motor_cmds)}"
 
         self.gamepad.update(parse_remote_data(msg.wireless_remote))
         for action in self.gamepad_actions:
             if eval('self.' + action):
-                for callback in self.input_callbacks[action]:
-                    callback()
+                if action in self.input_callbacks:
+                    for callback in self.input_callbacks[action]:
+                        callback()
         self.gamepad_lstick = [self.gamepad.lx, self.gamepad.ly]
         self.gamepad_rstick = [self.gamepad.rx, self.gamepad.ry]
 
-        self.joint_pos[:] = torch.tensor([x.q for x in motor_cmds]).float()
-        self.joint_vel[:] = torch.tensor([x.dq for x in motor_cmds]).float()
+        self.joint_pos[:] = torch.tensor([x.q for x in motor_cmds[:self.num_joints]]).float()
+        self.joint_vel[:] = torch.tensor([x.dq for x in motor_cmds[:self.num_joints]]).float()
         self.root_rpy[:] = torch.tensor([msg.imu_state.rpy[0], msg.imu_state.rpy[1], msg.imu_state.rpy[2]]).float()    
         self.root_quat[:] = torch.tensor([msg.imu_state.quaternion[0], msg.imu_state.quaternion[1], msg.imu_state.quaternion[2], msg.imu_state.quaternion[3]]).float()
         self.root_ang_vel[:] = torch.tensor([msg.imu_state.gyroscope[0], msg.imu_state.gyroscope[1], msg.imu_state.gyroscope[2]]).float()

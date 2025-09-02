@@ -196,14 +196,7 @@ class MujocoEnv(BaseEnv):
             self._ros_lowstate_pub = self._ros_node.create_publisher(LowState, 'lowstate_buffer', 1)
             self._ros_lowstate_sub = self._ros_node.create_subscription(LowState, 'lowstate', self._lowstate_callback, 1)
             self._ros_lowcmd_sub = self._ros_node.create_subscription(LowCmd, 'lowcmd_buffer', self._lowcmd_callback, 1)
-            self._gamepad = Gamepad()
-            self._gamepad_lstick = [0.0, 0.0]
-            self._gamepad_rstick = [0.0, 0.0]
-            self._gamepad_actions = ['gamepad.L1.pressed', 'gamepad.L2.pressed', 
-                                    'gamepad.R1.pressed', 'gamepad.R2.pressed', 
-                                    'gamepad.A.pressed', 'gamepad.B.pressed', 
-                                    'gamepad.X.pressed', 'gamepad.Y.pressed',
-                                    'gamepad.start.pressed', 'gamepad.select.pressed']
+            self._wireless_remote = None
             motor_states = [MotorState() for _ in range(35)]
             self._sim_lowstate = LowState(motor_state=motor_states)
 
@@ -223,13 +216,7 @@ class MujocoEnv(BaseEnv):
     def _lowstate_callback(self, msg):
         """Callback for lowstate topic, just for receiving remote data"""
         self._lowstate = msg
-        self._gamepad.update(self.parse_remote_data(msg.wireless_remote))
-        for action in self._gamepad_actions:
-            if eval('self.' + action):
-                for callback in self.input_callbacks[action]:
-                    callback()
-        self._gamepad_lstick = [self._gamepad.lx, self._gamepad.ly]
-        self._gamepad_rstick = [self._gamepad.rx, self._gamepad.ry]
+        self._wireless_remote = deepcopy(msg.wireless_remote)
 
     def _lowcmd_callback(self, msg):
         """Callback for lowcmd topic, just for sending remote data"""
@@ -254,6 +241,8 @@ class MujocoEnv(BaseEnv):
             lowstate.motor_state[i].mode = 1
             lowstate.motor_state[i].q = float(joint_state['joint_pos'][i])
             lowstate.motor_state[i].dq = float(joint_state['joint_vel'][i])
+        if self._wireless_remote is not None:   
+            lowstate.wireless_remote = deepcopy(self._wireless_remote)
         lowstate.imu_state.rpy = root_state['root_rpy']
         lowstate.imu_state.quaternion = root_state['root_quat']
         lowstate.imu_state.gyroscope = root_state['root_ang_vel']
