@@ -27,6 +27,7 @@ from copy import deepcopy
 from .math_utils import (
     euler_xyz_from_quat,
     quat_apply_inverse,
+    quat_mul,
 )
 import rclpy
 from rclpy.node import Node
@@ -54,6 +55,19 @@ class UnitreeEnv(BaseEnv, Node):
                  init_rclpy: bool = True,
                  spin_timeout: float = 0.001,
                  simulated_state: bool = False,
+                 fk_urdf_path: str | None = None,
+                 fk_xml_path: str | None = None,
+                 fk_enable_viewer: bool = False,
+                 fk_max_viewer_spheres: int = 0,
+                 fk_body_names: list[str] | None = None,
+                 enable_overheat_protection: bool = False,
+                 overheat_protection_threshold: dict[int, float] = {
+                        80: 1.0, # 80C of the maximum torque
+                        90: 0.8, # 90C of the maximum torque
+                        100: 0.5, # 100C of the maximum torque
+                        120: 0.2, # 120C of the maximum torque
+                        135: 0.0, # 135C of the maximum torque
+                    },
                  **kwargs):
         """
         Initialize MuJoCo environment
@@ -97,6 +111,30 @@ class UnitreeEnv(BaseEnv, Node):
         assert self.joint_limits.shape[1] == 2
         assert self.joint_limits.shape[0] == len(joint_order)
         self.ignore_limit_joints = self.emergency_stop_condition.get('ignore_limit_joints', [])
+        self.enable_overheat_protection = enable_overheat_protection
+        self.overheat_protection_threshold = overheat_protection_threshold
+        self.overheat_protection_ratios: list[float] = [] # divide to bins
+
+        # Initialize overheat protection ratios
+        temp_keys = list(self.overheat_protection_threshold.keys())
+        assert all(temp_keys[i] < temp_keys[i+1] for i in range(len(temp_keys) - 1)), "Temperature keys must be in ascending order"
+        assert self.overheat_protection_threshold[temp_keys[0]] == 1.0, "Minimum temperature threshold must be 1.0"
+        for i in range(150): # max temperature is 150C
+            found = False
+            for id, temp_key in enumerate(temp_keys):
+                if i < temp_key:
+                    found = True
+                    break
+            if not found:
+                self.overheat_protection_ratios.append(0.0)
+            else:
+                if id == 0:
+                    self.overheat_protection_ratios.append(self.overheat_protection_threshold[temp_keys[0]])
+                else:
+                    ratio = (i - temp_keys[id-1]) / (temp_keys[id] - temp_keys[id-1])
+                    self.overheat_protection_ratios.append( \
+                        self.overheat_protection_threshold[temp_keys[id-1]] * (1.0 - ratio) + \
+                        self.overheat_protection_threshold[temp_keys[id]] * ratio)
 
         # State variables
         self.step_count = 0
@@ -155,9 +193,12 @@ class UnitreeEnv(BaseEnv, Node):
         # Initialize state buffers
         self.joint_pos = torch.zeros(self.num_joints)
         self.joint_vel = torch.zeros(self.num_joints)
+        self.joint_temperature = torch.zeros(self.num_joints)
         self.root_rpy = torch.zeros(3)
+        self.root_pos = torch.zeros(3)
         self.root_quat = torch.zeros(4)
         self.root_ang_vel = torch.zeros(3)
+        self.root_quat_offset = torch.tensor([1.0, 0.0, 0.0, 0.0])
 
         # Initialize target positions
         self.target_positions = torch.zeros(self.num_joints)
@@ -167,7 +208,7 @@ class UnitreeEnv(BaseEnv, Node):
         self.crc = CRC()
 
         # Initialize gamepad
-        self.gamepad = Gamepad()
+        self.gamepad = Gamepad(smooth=1.0)
         self.gamepad_lstick = [0.0, 0.0]
         self.gamepad_rstick = [0.0, 0.0]
         self.gamepad_actions = ['gamepad.L1.pressed', 'gamepad.L2.pressed', 
@@ -192,6 +233,37 @@ class UnitreeEnv(BaseEnv, Node):
         else:
             for name in action_joint_names:
                 self.action_joints.append(self.joint_order_names.index(name))
+
+        # FK service
+        self.fk_urdf_path = fk_urdf_path
+        if self.fk_urdf_path is not None:
+            self.enable_fk = True
+            from .fk_service import start_fk_service
+            from multiprocessing import Process
+            from multiprocessing.shared_memory import SharedMemory
+            assert fk_body_names is not None, "fk_body_names must be provided when using fk_urdf_path"
+            self.fk_qpos_shm = SharedMemory(create=True, size=(7+len(self.joint_order_names))*4)
+            self.fk_body_pose_shm = SharedMemory(create=True, size=len(fk_body_names)*7*4)
+            self.fk_qpos_shm_array = np.ndarray(shape=(7+len(self.joint_order_names),), dtype=np.float32, buffer=self.fk_qpos_shm.buf)
+            self.fk_body_pose_shm_array = np.ndarray(shape=len(fk_body_names)*7, dtype=np.float32, buffer=self.fk_body_pose_shm.buf)
+            if fk_max_viewer_spheres > 0:
+                self.fk_debug_spheres_shm = SharedMemory(create=True, size=fk_max_viewer_spheres*7*4)
+                self.fk_debug_spheres_shm_array = np.ndarray(shape=(fk_max_viewer_spheres, 7), dtype=np.float32, buffer=self.fk_debug_spheres_shm.buf)
+                self.fk_debug_spheres_shm_array[:, 3:7] = np.array([[1, 1, 0, 1]], dtype=np.float32)
+            else:
+                self.fk_debug_spheres_shm_array = None
+            self.fk_qpos = torch.from_numpy(self.fk_qpos_shm_array)
+            self.fk_body_pose = torch.from_numpy(self.fk_body_pose_shm_array).view(-1, 7)
+
+            self.fk_body_name2id = {name: i for i, name in enumerate(fk_body_names)}
+            self.fk_service_process = Process(target=start_fk_service, 
+                    args=(self.fk_urdf_path, self.joint_order_names, 
+                    fk_body_names, self.fk_qpos_shm.name, self.fk_body_pose_shm.name,
+                    self.fk_debug_spheres_shm.name if fk_max_viewer_spheres > 0 else None,
+                    fk_xml_path, fk_enable_viewer, fk_max_viewer_spheres))
+            self.fk_service_process.start()
+        else:
+            self.enable_fk = False
         
         print(f"UnitreeEnv initialized:")
         print(f"  Joints: {len(self.joint_order_names)}")
@@ -219,10 +291,18 @@ class UnitreeEnv(BaseEnv, Node):
 
         self.joint_pos[:] = torch.tensor([x.q for x in motor_cmds[:self.num_joints]]).float()
         self.joint_vel[:] = torch.tensor([x.dq for x in motor_cmds[:self.num_joints]]).float()
+        self.joint_temperature[:] = torch.tensor([x.temperature[1] for x in motor_cmds[:self.num_joints]]).long()
         self.root_rpy[:] = torch.tensor([msg.imu_state.rpy[0], msg.imu_state.rpy[1], msg.imu_state.rpy[2]]).float()    
-        self.root_quat[:] = torch.tensor([msg.imu_state.quaternion[0], msg.imu_state.quaternion[1], msg.imu_state.quaternion[2], msg.imu_state.quaternion[3]]).float()
+        self.root_quat[:] = quat_mul(
+            self.root_quat_offset, 
+            torch.tensor([msg.imu_state.quaternion[0], msg.imu_state.quaternion[1], msg.imu_state.quaternion[2], msg.imu_state.quaternion[3]]).float()
+        )
         self.root_ang_vel[:] = torch.tensor([msg.imu_state.gyroscope[0], msg.imu_state.gyroscope[1], msg.imu_state.gyroscope[2]]).float()
         self._check_emergency_stop_condition()
+
+        if self.enable_fk:
+            self.fk_qpos[3:7] = self.root_quat
+            self.fk_qpos[7:] = self.joint_pos
 
     def _check_emergency_stop_condition(self) -> bool:
         """Check if the emergency stop condition is met"""
@@ -308,6 +388,48 @@ class UnitreeEnv(BaseEnv, Node):
         """
         # Get body positions and orientations
         raise NotImplementedError("Body data not implemented for sim2real, consider LiDAR plugin.")
+
+    def get_body_data_by_name(self, name: str) -> torch.Tensor:
+        """
+        Get current body data by name
+        
+        Returns:
+            torch.Tensor: Body data by name
+        """
+        assert self.enable_fk, "FK is not enabled"
+        if name in self.fk_body_name2id:
+            return self.fk_body_pose[self.fk_body_name2id[name]].clone()
+        elif name in self.external_body_data:
+            return self.external_body_data[name].clone()
+        else:
+            raise ValueError(f"Body name {name} not found")
+
+    @torch.inference_mode()
+    def update_root_pose(self, pos: torch.Tensor | None = None, 
+                         delta_quat: torch.Tensor | None = None) -> None:
+        """Update root pose"""
+        if pos is not None:
+            self.root_pos[:] = pos
+            if self.enable_fk:
+                self.fk_qpos[0:3] = pos
+        if delta_quat is not None:
+            self.root_quat_offset[:] = delta_quat
+
+    @torch.inference_mode()
+    def update_debug_spheres(self, pos: np.ndarray | None = None, 
+                             rgba: np.ndarray | None = None, ids: list[int] | None = None):
+        """Update debug spheres"""
+        assert self.fk_debug_spheres_shm_array is not None, "fk_debug_spheres_shm_array must be provided when max_viewer_spheres > 0"
+        if pos is not None:
+            if ids is not None:
+                self.fk_debug_spheres_shm_array[ids, :3] = pos
+            else:
+                self.fk_debug_spheres_shm_array[:, :3] = pos
+        if rgba is not None:
+            if ids is not None:
+                self.fk_debug_spheres_shm_array[ids, 3:7] = rgba
+            else:
+                self.fk_debug_spheres_shm_array[:, 3:7] = rgba
     
     def set_pd_gains(self, kp=None, kd=None):
         """
@@ -398,7 +520,13 @@ class UnitreeEnv(BaseEnv, Node):
 
         # publish motor commands
         for i in range(self.num_joints):
-            self.motor_cmd[i].q = self.target_positions[i].item()
+            target_position = self.target_positions[i].item()
+            if self.enable_overheat_protection:
+                temperature = int(self.joint_temperature[i].item())
+                if temperature >= len(self.overheat_protection_ratios):
+                    temperature = len(self.overheat_protection_ratios) - 1
+                target_position = target_position * self.overheat_protection_ratios[temperature]
+            self.motor_cmd[i].q = target_position
         self.lowcmd.motor_cmd = self.motor_cmd.copy()
         self.lowcmd.crc = self.crc.Crc(self.lowcmd) # type: ignore
         self.lowcmd_pub.publish(self.lowcmd)

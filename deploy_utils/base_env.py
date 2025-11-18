@@ -31,6 +31,11 @@ class BaseEnv:
                  spin_timeout: float = 0.001,
                  launch_input_thread: bool = True,
                  simulated_state: bool = False,
+                 fk_urdf_path: str | None = None,
+                 fk_xml_path: str | None = None,
+                 fk_enable_viewer: bool = False,
+                 fk_max_viewer_spheres: int = 0,
+                 fk_body_names: list[str] | None = None,
                  emergency_stop_condition: dict[str, Any] = {
                     'joint_pos_limit': 0.98,
                     'ignore_limit_joints': [],
@@ -84,6 +89,12 @@ class BaseEnv:
             self.input_thread.start()
         else:
             self.input_thread = None
+
+        # Rigid body handler
+        self.rigid_body_handler = None
+
+        # External body data
+        self.external_body_data: dict[str, torch.Tensor] = {}
 
     @staticmethod
     def data_interface(func: Callable) -> Callable:
@@ -186,3 +197,50 @@ class BaseEnv:
     @data_interface
     def get_body_data(self) -> dict[str, torch.Tensor]:
         raise NotImplementedError("This function should be implemented by the subclass")
+
+    def get_body_data_by_name(self, name: str) -> torch.Tensor:
+        raise NotImplementedError("This function should be implemented by the subclass")
+
+    def update_external_body_data(self, name: str, data: torch.Tensor) -> None:
+        assert data.shape[0] == 7, "data must be a 7D tensor, [pos, quat]"
+        self.external_body_data[name] = data
+
+    def update_root_pose(self, pos: torch.Tensor | None = None, 
+                         delta_quat: torch.Tensor | None = None) -> None:
+        """Update root pose, this is a no-op for base class"""
+        pass
+
+    ###################
+    # Rigid body handler
+    ###################
+
+    def initialize_rigid_body_handler(self, data_history_length: int = 5, device: str = 'cuda') -> None:
+        if self.rigid_body_handler is not None:
+            raise RuntimeError("Rigid body handler already initialized")
+        
+        from .rigid_body_handler import RigidBodyHandler
+        self.rigid_body_handler = RigidBodyHandler(data_history_length, device)
+
+    def update_rigid_bodies(self, body_names: list[str], body_poses: torch.Tensor,
+                            body_offsets: list[torch.Tensor] | None = None,
+                            body_mesh_paths: list[str] | None = None,
+                            body_cloud_paths: list[str] | None = None,
+                            overwrite_sdf: bool = False) -> None:
+        if self.rigid_body_handler is None:
+            raise RuntimeError("Rigid body handler not initialized")
+        if body_mesh_paths is None:
+            body_mesh_paths = [None] * len(body_names)
+        if body_cloud_paths is None:
+            body_cloud_paths = [None] * len(body_names)
+        if body_offsets is None:
+            body_offsets = [None] * len(body_names)
+
+        for name, pose, offset, mesh_path, cloud_path in zip(
+            body_names, body_poses, body_offsets, body_mesh_paths, body_cloud_paths):
+            self.rigid_body_handler.update_rigid_body_data(name, pose, offset, mesh_path, cloud_path, 
+                                                            overwrite_sdf=overwrite_sdf)
+
+    def query_closest_weighted_sdf(self, query_points: torch.Tensor, max_valid_distance: float | None = None) -> tuple[torch.Tensor, torch.Tensor]:
+        if self.rigid_body_handler is None:
+            raise RuntimeError("Rigid body handler not initialized")
+        return self.rigid_body_handler.query_closest_weighted_sdf(query_points, max_valid_distance)

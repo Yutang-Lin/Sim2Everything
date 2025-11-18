@@ -138,6 +138,7 @@ class MujocoEnv(BaseEnv):
         self.joint_names = [self.model.actuator(i).name for i in range(self.model.nu)]
         # Get body names
         self.body_names = [self.model.body(i).name for i in range(self.model.nbody)]
+        self.body_name2id = {name: i for i, name in enumerate(self.body_names)}
         # Get imu link id
         self.imu_link_id = self.body_names.index(imu_link_name) if imu_link_name is not None else None
 
@@ -170,6 +171,8 @@ class MujocoEnv(BaseEnv):
             for name in action_joint_names:
                 self.action_joints.append(self.joint_names.index(name))
 
+        self.gamepad_lstick = [0.0, 0.0]
+        self.gamepad_rstick = [0.0, 0.0]
         self.register_input_callback('r', self.reset)
         self.register_input_callback('rf', self.reset)
         self.register_input_callback('q', self.close)
@@ -330,6 +333,16 @@ class MujocoEnv(BaseEnv):
         # refresh data is no-ops for sim2sim
         pass
     
+    def get_body_data_by_name(self, name: str) -> torch.Tensor:
+        """
+        Get current body data by name
+        
+        Returns:
+            torch.Tensor: Body data by name
+        """
+        body_id = self.body_name2id[name]
+        return torch.from_numpy(np.concatenate([self.data.xpos[body_id].copy(), self.data.xquat[body_id].copy()], axis=0)).float()
+
     @BaseEnv.data_interface
     def get_joint_data(self):
         """
