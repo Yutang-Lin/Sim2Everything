@@ -1,6 +1,6 @@
 # Sim-to-Everything
 ## Introduction
-Simple implementation of Gym stype simulator environments for sim2sim. Along with a wrapped ROS2 environment for Unitree robots' real deployment with same interface as simulators, provide seamless transfer between sim2sim and sim2real.
+Simple implementation of Gym style simulation environments for sim2sim. Along with a wrapped ROS2 environment for Unitree robots' real deployment with same interface as simulators, provide seamless transfer between sim2sim and sim2real.
 
 ## Roadmap
 Here shows the roadmap of this repository.
