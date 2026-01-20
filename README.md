@@ -1,6 +1,6 @@
 # Sim-to-Everything
 ## Introduction
-Simple implementation of Gym stype simulator environments for sim2sim. Along with a wrapped ROS2 environment for Unitree robots' real deployment with same interface as simulators, provide seamless transfer between sim2sim and sim2real.
+Simple implementation of Gym style simulation environments for sim2sim. Along with a wrapped ROS2 environment for Unitree robots' real deployment with same interface as simulators, provide seamless transfer between sim2sim and sim2real.
 
 ## Roadmap
 Here shows the roadmap of this repository.
@@ -24,7 +24,7 @@ policy_to_real = reindex(policy_joint_order, real_joint_order) # reindex(from, t
 """initialize env, setup control hz etc."""
 env = MujocoEnv(
     control_freq=50,
-    model_path='...', # sim2sim only
+    xml_path='...', # sim2sim only
     simulation_freq=1000 # sim2sim only
     joint_order=real_joint_order
 ) # UnitreeEnv(...) # switch freely
