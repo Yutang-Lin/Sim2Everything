@@ -292,6 +292,9 @@ class MotionSwitcher:
         return self.current_motion_data[0], self.current_motion_data[1], self.current_motion_data[2], self.current_motion_data[3] * float(self._dynamic), self.current_motion_data[4] * float(self._dynamic)
 
     def normalize_motion(self, motion_id, initial_quat: torch.Tensor):
+        if motion_id >= len(self.motions) or motion_id < 0:
+            print(f"Invalid motion id {motion_id}, switching to first motion")
+            motion_id = 0
         motion_data = self.motion_file[self.motions[motion_id]]
         delta_quat = math_utils.quat_mul(math_utils.yaw_quat(initial_quat), math_utils.quat_conjugate(math_utils.yaw_quat(motion_data['rb_quat'][0, 0])))
         motion_data['rb_pos'] = transforms.quaternion_apply(delta_quat[None, None, :], motion_data['rb_pos'])

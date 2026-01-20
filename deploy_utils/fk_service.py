@@ -3,9 +3,23 @@ import pytorch_kinematics as pk
 import pytorch_kinematics.transforms as transforms
 from multiprocessing.shared_memory import SharedMemory
 import numpy as np
+from typing import Any
 import time
 import mujoco
 import mujoco.viewer
+
+class FKSharedSphere:
+    def __init__(self, idx: int, shm_array: np.ndarray):
+        self.idx = idx
+        self.shm_array = shm_array
+
+    def __setattr__(self, name: str, value: Any):
+        if name == "pos":
+            self.shm_array[self.idx, :3] = value
+        elif name == "rgba":
+            self.shm_array[self.idx, 3:7] = value
+        else:
+            super().__setattr__(name, value)
 
 class FKService:
     def __init__(self, 

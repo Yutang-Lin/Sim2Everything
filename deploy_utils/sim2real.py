@@ -44,6 +44,7 @@ from .base_env import BaseEnv
 
 class UnitreeEnv(BaseEnv, Node):
     simulated = False
+    env_type = 'unitree'
 
     def __init__(self, control_freq: int = 100, 
                  joint_order: list[str] | None = None,
@@ -63,10 +64,9 @@ class UnitreeEnv(BaseEnv, Node):
                  enable_overheat_protection: bool = False,
                  overheat_protection_threshold: dict[int, float] = {
                         80: 1.0, # 80C of the maximum torque
-                        90: 0.8, # 90C of the maximum torque
-                        100: 0.5, # 100C of the maximum torque
-                        120: 0.2, # 120C of the maximum torque
-                        135: 0.0, # 135C of the maximum torque
+                        90: 0.5, # 90C of the maximum torque
+                        100: 0.2, # 100C of the maximum torque
+                        110: 0.0, # 120C of the maximum torque
                     },
                  **kwargs):
         """
@@ -194,6 +194,7 @@ class UnitreeEnv(BaseEnv, Node):
         self.joint_pos = torch.zeros(self.num_joints)
         self.joint_vel = torch.zeros(self.num_joints)
         self.joint_temperature = torch.zeros(self.num_joints)
+        self.joint_tau_est = torch.zeros(self.num_joints)
         self.root_rpy = torch.zeros(3)
         self.root_pos = torch.zeros(3)
         self.root_quat = torch.zeros(4)
@@ -252,6 +253,7 @@ class UnitreeEnv(BaseEnv, Node):
                 self.fk_debug_spheres_shm_array[:, 3:7] = np.array([[1, 1, 0, 1]], dtype=np.float32)
             else:
                 self.fk_debug_spheres_shm_array = None
+            self.fk_debug_spheres = []
             self.fk_qpos = torch.from_numpy(self.fk_qpos_shm_array)
             self.fk_body_pose = torch.from_numpy(self.fk_body_pose_shm_array).view(-1, 7)
 
@@ -269,6 +271,9 @@ class UnitreeEnv(BaseEnv, Node):
         print(f"  Joints: {len(self.joint_order_names)}")
         print(f"  Control frequency: {control_freq} Hz")
         print(f"  Default PD gains: kp={self.kp[0]}, kd={self.kd[0]} (for all joints)")
+
+        # Initialize plugins
+        self.initialize_plugins()
 
     def _lowstate_callback(self, msg: LowState):
         """Callback for lowstate topic"""
@@ -292,6 +297,7 @@ class UnitreeEnv(BaseEnv, Node):
         self.joint_pos[:] = torch.tensor([x.q for x in motor_cmds[:self.num_joints]]).float()
         self.joint_vel[:] = torch.tensor([x.dq for x in motor_cmds[:self.num_joints]]).float()
         self.joint_temperature[:] = torch.tensor([x.temperature[1] for x in motor_cmds[:self.num_joints]]).long()
+        self.joint_tau_est[:] = torch.tensor([x.tau_est for x in motor_cmds[:self.num_joints]]).float()
         self.root_rpy[:] = torch.tensor([msg.imu_state.rpy[0], msg.imu_state.rpy[1], msg.imu_state.rpy[2]]).float()    
         self.root_quat[:] = quat_mul(
             self.root_quat_offset, 
@@ -525,7 +531,8 @@ class UnitreeEnv(BaseEnv, Node):
                 temperature = int(self.joint_temperature[i].item())
                 if temperature >= len(self.overheat_protection_ratios):
                     temperature = len(self.overheat_protection_ratios) - 1
-                target_position = target_position * self.overheat_protection_ratios[temperature]
+                target_position = float(target_position * self.overheat_protection_ratios[temperature] \
+                    + self.joint_pos[i] * (1 - self.overheat_protection_ratios[temperature]))
             self.motor_cmd[i].q = target_position
         self.lowcmd.motor_cmd = self.motor_cmd.copy()
         self.lowcmd.crc = self.crc.Crc(self.lowcmd) # type: ignore
@@ -604,6 +611,18 @@ class UnitreeEnv(BaseEnv, Node):
         """Close the environment and cleanup resources"""
         # Error in sim2real
         self.destroy_node()
+
+    def add_visual_sphere(self, pos: np.ndarray, radius: float, rgba: tuple[float, float, float, float]):
+        """Add a visual sphere to the viewer"""
+        assert self.enable_fk, "FK is not enabled"
+        assert self.fk_debug_spheres_shm_array is not None, "fk_debug_spheres_shm_array must be provided when max_viewer_spheres > 0"
+        from .fk_service import FKSharedSphere
+
+        new_debug_sphere = FKSharedSphere(len(self.fk_debug_spheres), self.fk_debug_spheres_shm_array)
+        new_debug_sphere.pos = pos
+        new_debug_sphere.rgba = rgba
+        self.fk_debug_spheres.append(new_debug_sphere)
+        return new_debug_sphere
 
 def main():
     """Main function to run the sim2real"""

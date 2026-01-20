@@ -33,6 +33,7 @@ import threading
 
 class MujocoEnv(BaseEnv):
     simulated = True
+    env_type = 'mujoco'
 
     def __init__(self, control_freq: int = 100, 
                  joint_order: list[str] | None = None,
@@ -219,6 +220,9 @@ class MujocoEnv(BaseEnv):
         print(f"  Decimation: {self.decimation} simulation steps per control step")
         print(f"  Armature: {joint_armature}")
         print(f"  Default PD gains: kp={self.kp[0]}, kd={self.kd[0]} (for all joints)")
+
+        # Initialize plugins
+        self.initialize_plugins()
 
     def _lowstate_callback(self, msg):
         """Callback for lowstate topic, just for receiving remote data"""

@@ -5,6 +5,8 @@ import threading
 import sys
 import select
 import time
+import torch.multiprocessing as mp
+from .base_plugin import BasePlugin
 
 def _noise_like(x: torch.Tensor, noise_type: str = 'uniform') -> torch.Tensor:
     if noise_type == 'uniform':
@@ -16,6 +18,7 @@ def _noise_like(x: torch.Tensor, noise_type: str = 'uniform') -> torch.Tensor:
 
 class BaseEnv:
     simulated = True
+    env_type: str = 'base'
 
     def __init__(self, control_freq: int = 100, 
                  joint_order: list[str] | None = None,
@@ -42,6 +45,14 @@ class BaseEnv:
                     'roll_limit': 1.57,
                  },
                  emergency_stop_breakpoint: bool = True,
+                 enable_overheat_protection: bool = False,
+                 overheat_protection_threshold: dict[int, float] = {
+                        80: 1.0, # 80C of the maximum torque
+                        90: 0.8, # 90C of the maximum torque
+                        100: 0.5, # 100C of the maximum torque
+                        120: 0.2, # 120C of the maximum torque
+                        135: 0.0, # 135C of the maximum torque
+                    },
 
                  # Simulation only
                  xml_path: str = '', 
@@ -59,8 +70,12 @@ class BaseEnv:
                         'root_rpy': 0.1,
                         'root_quat': 0.05,
                         'root_ang_vel': 0.2,
-                    }
+                    },
+                 plugins: list[BasePlugin] = [],
                  ):
+        self.plugins: list[BasePlugin] = plugins
+        self.plugin_processes: list[mp.Process] = []
+
         self.noise_level: float = noise_level
         self.noise_type: str = noise_type
         self.noise_scales: dict[str, float] = noise_scales
@@ -95,6 +110,15 @@ class BaseEnv:
 
         # External body data
         self.external_body_data: dict[str, torch.Tensor] = {}
+
+    def initialize_plugins(self) -> None:
+        """Initialize all plugins"""
+        for plugin in self.plugins:
+            run_args = plugin.initialize(env=self)
+            plugin_process = mp.Process(target=plugin.run, args=run_args if run_args is not None else ())
+            plugin_process.daemon = True
+            plugin_process.start()
+            self.plugin_processes.append(plugin_process)
 
     @staticmethod
     def data_interface(func: Callable) -> Callable:
@@ -240,7 +264,10 @@ class BaseEnv:
             self.rigid_body_handler.update_rigid_body_data(name, pose, offset, mesh_path, cloud_path, 
                                                             overwrite_sdf=overwrite_sdf)
 
-    def query_closest_weighted_sdf(self, query_points: torch.Tensor, max_valid_distance: float | None = None) -> tuple[torch.Tensor, torch.Tensor]:
+    def query_closest_sdf(self, query_points: torch.Tensor, 
+                          max_valid_distance: float | None = None,
+                          weighted_gradient: bool = True,
+                          weight_temperature: float = 0.5) -> tuple[torch.Tensor, torch.Tensor]:
         if self.rigid_body_handler is None:
             raise RuntimeError("Rigid body handler not initialized")
-        return self.rigid_body_handler.query_closest_weighted_sdf(query_points, max_valid_distance)
+        return self.rigid_body_handler.query_closest_sdf(query_points, max_valid_distance, weighted_gradient, weight_temperature)
